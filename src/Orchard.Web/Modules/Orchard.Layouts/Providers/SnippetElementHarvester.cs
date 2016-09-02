@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using Orchard.DisplayManagement;
 using Orchard.DisplayManagement.Descriptors;
 using Orchard.Environment;
@@ -20,10 +21,11 @@ using Orchard.Localization;
 using Orchard.Themes.Services;
 using Orchard.Tokens;
 using Orchard.Utility.Extensions;
+using YamlDotNet.Dynamic;
 
 namespace Orchard.Layouts.Providers {
     [OrchardFeature("Orchard.Layouts.Snippets")]
-    public class SnippetElementHarvester : Component, IElementHarvester {
+    public class SnippetElementHarvester : IElementHarvester {
         private const string SnippetShapeSuffix = "Snippet";
         private readonly Work<IShapeFactory> _shapeFactory;
         private readonly Work<ISiteThemeService> _siteThemeService;
@@ -62,15 +64,20 @@ namespace Orchard.Layouts.Providers {
             var snippetElement = (Snippet)_elementFactory.Value.Activate(elementType);
 
             foreach (var shapeDescriptor in shapeDescriptors) {
+                var snippetManifest = ParseSnippetManifest(shapeDescriptor.Value.BindingSource);
                 var shapeType = shapeDescriptor.Value.ShapeType;
-                var elementName = GetDisplayName(shapeDescriptor.Value.BindingSource);
+                var elementName = GetDisplayName(snippetManifest, shapeDescriptor.Value.BindingSource);
+                var toolboxIcon = GetToolboxIcon(snippetManifest, snippetElement);
+                var description = GetDescription(snippetManifest, shapeType);
+                var category = GetCategory(snippetManifest, snippetElement);
                 var closureDescriptor = shapeDescriptor;
-                yield return new ElementDescriptor(elementType, shapeType, T(elementName), T("An element that renders the {0} shape.", shapeType), snippetElement.Category) {
-                    Displaying = displayContext => Displaying(displayContext, closureDescriptor.Value),
-                    ToolboxIcon = "\uf10c",
-                    EnableEditorDialog = HasSnippetFields(shapeDescriptor.Value),
-                    Editor = ctx => Editor(DescribeSnippet(shapeType, snippetElement), ctx),
-                    UpdateEditor = ctx => UpdateEditor(DescribeSnippet(shapeType, snippetElement), ctx)
+                var snippetDescriptor = ParseSnippetDescriptor(snippetManifest);
+                yield return new ElementDescriptor(elementType, shapeType, new LocalizedString(elementName), description, category) {
+                    Displaying = displayContext => Displaying(displayContext, closureDescriptor.Value, snippetDescriptor),
+                    ToolboxIcon = toolboxIcon,
+                    EnableEditorDialog = snippetDescriptor != null || HasSnippetFields(shapeDescriptor.Value),
+                    Editor = ctx => Editor(snippetDescriptor ?? DescribeSnippet(shapeType, snippetElement), ctx),
+                    UpdateEditor = ctx => UpdateEditor(snippetDescriptor ?? DescribeSnippet(shapeType, snippetElement), ctx)
                 };
             }
         }
@@ -113,20 +120,88 @@ namespace Orchard.Layouts.Providers {
             context.EditorResult.Add(snippetEditorShape);
         }
 
-        private void Displaying(ElementDisplayingContext context, ShapeDescriptor shapeDescriptor) {
+        private void Displaying(ElementDisplayingContext context, ShapeDescriptor shapeDescriptor, SnippetDescriptor snippetDescriptor) {
             var shapeType = shapeDescriptor.ShapeType;
             var shape = (dynamic)_shapeFactory.Value.Create(shapeType);
 
             shape.Element = context.Element;
 
+            if (snippetDescriptor != null) {
+                foreach (var fieldDescriptor in snippetDescriptor.Fields) {
+                    var value = context.Element.Data.Get(fieldDescriptor.Name);
+                    shape.Properties[fieldDescriptor.Name] = value;
+                }
+            }
+
             ElementShapes.AddTokenizers(shape, _tokenizer.Value);
             context.ElementShape.Snippet = shape;
         }
 
-        private string GetDisplayName(string bindingSource) {
-            var fileName = Path.GetFileNameWithoutExtension(bindingSource);
+        private dynamic ParseSnippetManifest(string bindingSource) {
+            var physicalSourcePath = _wca.GetContext().HttpContext.Server.MapPath(bindingSource);
+            var paramsFileName = Path.Combine(Path.GetDirectoryName(physicalSourcePath) ?? "", Path.GetFileNameWithoutExtension(physicalSourcePath) + ".txt");
+
+            if (!File.Exists(paramsFileName))
+                return null;
+
+            var yaml = File.ReadAllText(paramsFileName);
+            var snippetConfig = Deserialize(yaml);
+
+            return snippetConfig;
+        }
+
+        private string GetDisplayName(dynamic snippetManifest, string bindingSource) {
+            if (snippetManifest != null && (string)snippetManifest.DisplayName != null) {
+                return (string)snippetManifest.DisplayName;
+            }
+
+            var fileName = Path.GetFileNameWithoutExtension(bindingSource) ?? "";
             var lastIndex = fileName.IndexOf(SnippetShapeSuffix, StringComparison.OrdinalIgnoreCase);
             return fileName.Substring(0, lastIndex).CamelFriendly();
+        }
+
+        private string GetToolboxIcon(dynamic snippetManifest, Snippet snippetElement) {
+            if (snippetManifest != null && (string)snippetManifest.ToolboxIcon != null) {
+                return Regex.Unescape((string)snippetManifest.ToolboxIcon);
+            }
+
+            return snippetElement.ToolboxIcon;
+        }
+
+        private LocalizedString GetDescription(dynamic snippetManifest, string shapeType) {
+            if (snippetManifest != null && (string)snippetManifest.Description != null) {
+                return new LocalizedString((string)snippetManifest.Description);
+            }
+
+            return new LocalizedString(String.Format("An element that renders the {0} shape.", shapeType));
+        }
+
+        private string GetCategory(dynamic snippetManifest, Snippet snippetElement) {
+            if (snippetManifest != null && (string)snippetManifest.Category != null) {
+                return (string)snippetManifest.Category;
+            }
+
+            return snippetElement.Category;
+        }
+
+        private SnippetDescriptor ParseSnippetDescriptor(dynamic snippetManifest) {
+            if(snippetManifest == null || snippetManifest.Fields.Count == 0) {
+                return null;
+            }
+
+            var fieldsConfig = snippetManifest.Fields.Children;
+            var descriptor = new SnippetDescriptor();
+
+            foreach (var fieldConfig in fieldsConfig) {
+                descriptor.Fields.Add(new SnippetFieldDescriptor {
+                    Name = (string)fieldConfig.Name,
+                    Type = (string)fieldConfig.Type,
+                    DisplayName = new LocalizedString((string)fieldConfig.DisplayName),
+                    Description = new LocalizedString((string)fieldConfig.Description)
+                });
+            }
+
+            return descriptor;
         }
 
         private SnippetDescriptor DescribeSnippet(string shapeType, Snippet element) {
@@ -165,6 +240,10 @@ namespace Orchard.Layouts.Providers {
 
             var markup = File.ReadAllText(localFileName);
             return markup.Contains("@Html.SnippetField");
+        }
+
+        private dynamic Deserialize(string yaml) {
+            return new DynamicYaml(yaml);
         }
     }
 }
